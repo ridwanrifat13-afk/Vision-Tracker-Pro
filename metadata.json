@@ -1,0 +1,5 @@
+{
+  "name": "VisionTracker Pro",
+  "description": "Live object tracking and coordinate visualization using mobile camera.",
+  "requestFramePermissions": ["camera"]
+}
