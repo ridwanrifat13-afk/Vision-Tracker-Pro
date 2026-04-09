@@ -101,12 +101,26 @@ export default function App() {
         audio: false,
       };
 
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('BROWSER_UNSUPPORTED');
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       videoRef.current.srcObject = stream;
       setIsCameraActive(true);
     } catch (error: any) {
       console.error('Error accessing camera:', error);
-      setCameraError('Camera access denied or unavailable. Please enable device camera.');
+      
+      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError' || error.message?.toLowerCase().includes('denied')) {
+        setCameraError('Camera access was denied. To fix this:\n1. Click the lock icon 🔒 in your browser address bar.\n2. Change "Camera" to "Allow".\n3. Refresh the page or click "Retry Connection".\n\nNote: If you are in a private/incognito window, you may need to enable permissions manually.');
+      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+        setCameraError('No camera found. Please ensure your camera is connected and not being used by another app.');
+      } else if (error.message === 'BROWSER_UNSUPPORTED') {
+        setCameraError('Your browser does not support camera access or you are in an insecure context. Please try a different browser or open the app in a new tab.');
+      } else {
+        setCameraError(`Camera Error: ${error.message || 'Unknown error'}. Please ensure no other application is using the camera.`);
+      }
+      
       setIsCameraActive(false);
     }
   }, [cameraFacing, targetResolution, targetFps]);
@@ -416,7 +430,7 @@ export default function App() {
               <Camera className="w-10 h-10 text-white/50" />
             </div>
             <h3 className="text-lg font-black uppercase tracking-widest mb-3 bg-clip-text text-transparent bg-gradient-to-r from-red-400 to-rose-300">Camera Access Required</h3>
-            <div className="text-sm text-white/60 max-w-md mb-8 leading-relaxed font-light">
+            <div className="text-sm text-white/60 max-w-md mb-8 leading-relaxed font-light whitespace-pre-line">
               {cameraError || "The application requires camera access to process spatial data in real-time."}
             </div>
             <button 
@@ -508,25 +522,25 @@ export default function App() {
       <footer className="h-44 px-4 pb-4 pt-2 z-20 shrink-0">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-full">
           {/* Spatial Coordinates Info Panel */}
-          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-4 flex flex-col gap-2 relative overflow-hidden group">
+          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-3 md:p-4 flex flex-row md:flex-col gap-3 md:gap-2 relative overflow-hidden group">
             <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-[40px] -mr-10 -mt-10 transition-opacity group-hover:opacity-100 opacity-50" />
-            <div className="flex items-center justify-between border-b border-white/10 pb-2 relative z-10">
-              <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50 flex items-center gap-1.5">
-                <MapPin className="w-3 h-3 text-cyan-400" /> Spatial Coordinates
+            <div className="w-[35%] md:w-full flex flex-col justify-center border-r md:border-r-0 md:border-b border-white/10 pr-3 md:pr-0 md:pb-2 relative z-10 shrink-0">
+              <span className="text-[8px] md:text-[10px] font-bold uppercase tracking-[0.1em] md:tracking-[0.2em] text-cyan-100/50 flex items-center gap-1 md:gap-1.5">
+                <MapPin className="w-2.5 h-2.5 md:w-3 md:h-3 text-cyan-400" /> <span className="truncate">Spatial Data</span>
               </span>
               {selectedCoords && (
-                <span className="text-[10px] font-bold text-cyan-400 tracking-widest bg-cyan-400/10 px-2 py-0.5 rounded-md border border-cyan-400/20">
-                  SYNCED: {trackingLabel?.toUpperCase()}
+                <span className="text-[8px] md:text-[10px] font-bold text-cyan-400 tracking-tighter md:tracking-widest bg-cyan-400/10 px-1.5 md:px-2 py-0.5 rounded-md border border-cyan-400/20 mt-1 inline-block w-fit truncate">
+                  {trackingLabel?.toUpperCase()}
                 </span>
               )}
             </div>
-            <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-3 mt-2 relative z-10">
+            <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-1.5 md:gap-3 relative z-10 overflow-y-auto md:overflow-visible custom-scrollbar">
               {['X', 'Y', 'W', 'H'].map((dim) => {
                 const val = selectedCoords ? (dim === 'X' ? selectedCoords.x : dim === 'Y' ? selectedCoords.y : dim === 'W' ? selectedCoords.w : selectedCoords.h) : null;
                 return (
-                  <div key={dim} className="flex flex-col justify-center bg-black/20 rounded-xl p-3 border border-white/5">
-                    <span className="text-[9px] font-bold text-white/30 uppercase tracking-widest mb-1.5">POS_{dim}</span>
-                    <span className={`text-xl font-mono tracking-tight font-light ${val !== null ? 'text-cyan-50 drop-shadow-[0_0_8px_rgba(0,240,255,0.4)]' : 'text-white/20'}`}>
+                  <div key={dim} className="flex flex-col justify-center bg-black/20 rounded-lg md:rounded-xl p-1.5 md:p-3 border border-white/5">
+                    <span className="text-[7px] md:text-[9px] font-bold text-white/30 uppercase tracking-widest mb-0.5 md:mb-1.5">{dim}</span>
+                    <span className={`text-xs md:text-xl font-mono tracking-tight font-light ${val !== null ? 'text-cyan-50 drop-shadow-[0_0_8px_rgba(0,240,255,0.4)]' : 'text-white/20'}`}>
                       {val !== null ? val.toString().padStart(4, '0') : '0000'}
                     </span>
                   </div>
@@ -536,36 +550,36 @@ export default function App() {
           </div>
 
           {/* Environmental Detections Feed List */}
-          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-4 flex flex-col relative overflow-hidden">
+          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-3 md:p-4 flex flex-row md:flex-col relative overflow-hidden">
             <div className="absolute bottom-0 left-0 w-40 h-40 bg-indigo-500/5 rounded-full blur-[40px] -ml-10 -mb-10" />
-            <div className="flex items-center justify-between border-b border-white/10 pb-2 mb-3 relative z-10">
-              <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50 flex items-center gap-1.5">
-                <Scan className="w-3 h-3 text-indigo-400" /> Environment Entities
+            <div className="w-[35%] md:w-full flex flex-col justify-center border-r md:border-r-0 md:border-b border-white/10 pr-3 md:pr-0 md:pb-2 md:mb-3 relative z-10 shrink-0">
+              <span className="text-[8px] md:text-[10px] font-bold uppercase tracking-[0.1em] md:tracking-[0.2em] text-cyan-100/50 flex items-center gap-1 md:gap-1.5">
+                <Scan className="w-2.5 h-2.5 md:w-3 md:h-3 text-indigo-400" /> <span className="truncate">Entities</span>
               </span>
-              <span className="text-[10px] font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-0.5 rounded-md border border-indigo-500/20">
-                {detectedUIObjects.length} FOUND
+              <span className="text-[8px] md:text-[10px] font-bold text-indigo-300 bg-indigo-500/10 px-1.5 md:px-2.5 py-0.5 rounded-md border border-indigo-500/20 mt-1 inline-block w-fit">
+                {detectedUIObjects.length}
               </span>
             </div>
-            <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar relative z-10 -mx-1 px-1 mt-1">
+            <div className="flex-1 overflow-y-auto pr-1 md:pr-2 custom-scrollbar relative z-10 md:-mx-1 md:px-1 md:mt-1 ml-2 md:ml-0">
               {detectedUIObjects.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-xs text-white/30 font-light italic tracking-wide pb-4">
-                  Awaiting visual subjects...
+                <div className="h-full flex items-center justify-center text-[10px] md:text-xs text-white/30 font-light italic tracking-wide">
+                  Scanning...
                 </div>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 pb-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 md:gap-2.5 pb-1">
                   {detectedUIObjects.map((obj, i) => {
                     const isSelected = trackingLabel === obj.class;
                     return (
                       <button
                         key={`${obj.class}-${i}`}
                         onClick={() => handleObjectSelect(obj)}
-                        className={`w-full text-left px-3 py-2.5 rounded-xl text-[10px] flex justify-between items-center transition-all ${
+                        className={`w-full text-left px-2 py-1.5 md:px-3 md:py-2.5 rounded-lg md:rounded-xl text-[8px] md:text-[10px] flex justify-between items-center transition-all ${
                           isSelected 
                             ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,240,255,0.15)] scale-[1.02]' 
                             : 'bg-black/40 text-white/70 border border-white/5 hover:bg-white/10 hover:border-white/20 hover:text-white'
                         }`}
                       >
-                        <span className="uppercase font-bold tracking-wider truncate mr-2">{obj.class}</span>
+                        <span className="uppercase font-bold tracking-wider truncate mr-1">{obj.class}</span>
                         <span className={`font-mono ${isSelected ? 'opacity-100' : 'opacity-40'}`}>{(obj.score * 100).toFixed(0)}%</span>
                       </button>
                     )
