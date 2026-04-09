@@ -40,15 +40,13 @@ export default function App() {
   const [cameraFacing, setCameraFacing] = useState<'user' | 'environment'>('environment');
   const [targetFps, setTargetFps] = useState<number>(60);
   const [targetResolution, setTargetResolution] = useState<'480p' | '720p' | '1080p'>('720p');
-  const [minObjectSize, setMinObjectSize] = useState<number>(50);
-  const [smoothingFactor, setSmoothingFactor] = useState<number>(0.25);
   const [modelError, setModelError] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [selectedCoords, setSelectedCoords] = useState<{x:number, y:number, w:number, h:number} | null>(null);
 
   // Mutable refs for high-frequency loops (no React re-renders)
   const predictionsRef = useRef<DetectedObject[]>([]);
-  const trackedTargetRef = useRef<(TrackedTarget & { lostFrames: number, confidence: number }) | null>(null);
+  const trackedTargetRef = useRef<TrackedTarget | null>(null);
 
   // Colors
   const colors = {
@@ -148,13 +146,8 @@ export default function App() {
       
       if (model && videoRef.current && videoRef.current.readyState === 4) {
         try {
-          // 1. Use a Real Object Detection Model (COCO-SSD already in use)
-          // Increased max objects to 80 and lowered threshold to 0.3 for better candidate pool
-          const rawPredictions = await model.detect(videoRef.current, 80, 0.3);
-          
-          // 3. Add Minimum Object Size Rule
-          // Ignore objects smaller than minObjectSize px (default 50px)
-          const predictions = rawPredictions.filter(p => p.bbox[2] >= minObjectSize && p.bbox[3] >= minObjectSize);
+          // Broadened object identification: 50 max objects, 35% minimum confidence
+          const predictions = await model.detect(videoRef.current, 50, 0.35);
           predictionsRef.current = predictions;
 
           if (trackedTargetRef.current) {
@@ -177,25 +170,7 @@ export default function App() {
                 }
               });
 
-              // 4. Add Tracker Confidence Check
-              // If the best match is too far away, consider it a "lost" frame
-              const distanceThreshold = Math.max(trackedTargetRef.current.bbox[2], trackedTargetRef.current.bbox[3]) * 1.5;
-              
-              if (minDistance < distanceThreshold) {
-                trackedTargetRef.current.bbox = bestMatch.bbox;
-                trackedTargetRef.current.confidence = bestMatch.score;
-                trackedTargetRef.current.lostFrames = 0;
-              } else {
-                trackedTargetRef.current.lostFrames++;
-              }
-            } else {
-              trackedTargetRef.current.lostFrames++;
-            }
-
-            // If lost for more than 20 frames, reset tracker
-            if (trackedTargetRef.current.lostFrames > 20) {
-              trackedTargetRef.current = null;
-              setTrackingLabel(null);
+              trackedTargetRef.current.bbox = bestMatch.bbox;
             }
           }
 
@@ -220,7 +195,7 @@ export default function App() {
       detect();
     }
     return () => { active = false; };
-  }, [model, isCameraActive, isModelLoading, targetFps, minObjectSize]);
+  }, [model, isCameraActive, isModelLoading, targetFps]);
 
   // UI Throttle Loop (Updates React UI state sparingly to save performance)
   useEffect(() => {
@@ -280,7 +255,7 @@ export default function App() {
           // Process Tracked Target with Exponential Moving Average (EMA) smoothing
           if (trackedTargetRef.current) {
             const target = trackedTargetRef.current;
-            const alpha = smoothingFactor; // 5. Use Bounding Box Smoothing (EMA)
+            const alpha = 0.25; // Smoothness factor (lower = smoother but more delay)
 
             target.smoothBbox = [
               target.smoothBbox[0] + alpha * (target.bbox[0] - target.smoothBbox[0]),
@@ -292,8 +267,7 @@ export default function App() {
             const [x, y, w, h] = target.smoothBbox;
 
             // Target Highlight Box Core
-            const isLost = target.lostFrames > 0;
-            ctx.strokeStyle = isLost ? 'rgba(255, 50, 50, 0.8)' : colors.primary;
+            ctx.strokeStyle = colors.primary;
             ctx.lineWidth = 3;
             ctx.strokeRect(x, y, w, h);
             
@@ -301,7 +275,7 @@ export default function App() {
             const cornerLength = 15;
             ctx.beginPath();
             ctx.lineWidth = 4;
-            ctx.strokeStyle = isLost ? '#FF0000' : '#FFFFFF';
+            ctx.strokeStyle = '#FFFFFF';
             
             // Top Left
             ctx.moveTo(x, y + cornerLength); ctx.lineTo(x, y); ctx.lineTo(x + cornerLength, y);
@@ -314,10 +288,10 @@ export default function App() {
             ctx.stroke();
 
             // Label
-            const labelText = isLost ? `LOST LOCK: ${target.class.toUpperCase()}` : `LOCKED: ${target.class.toUpperCase()} (${(target.confidence * 100).toFixed(0)}%)`;
+            const labelText = `LOCKED TRACKING: ${target.class.toUpperCase()}`;
             ctx.font = 'bold 12px "Courier New", Courier, monospace';
             const metrics = ctx.measureText(labelText);
-            ctx.fillStyle = isLost ? 'rgba(255, 0, 0, 0.8)' : colors.primary;
+            ctx.fillStyle = colors.primary;
             ctx.fillRect(x - 2, y - 28, metrics.width + 16, 26);
             ctx.fillStyle = '#000000';
             ctx.fillText(labelText, x + 6, y - 10);
@@ -339,16 +313,14 @@ export default function App() {
 
     render();
     return () => cancelAnimationFrame(animationFrameId);
-  }, [smoothingFactor]);
+  }, []);
 
   const handleObjectSelect = (obj: DetectedObject) => {
     setTrackingLabel(obj.class);
     trackedTargetRef.current = { 
       class: obj.class, 
       bbox: [...obj.bbox] as [number, number, number, number],
-      smoothBbox: [...obj.bbox] as [number, number, number, number],
-      lostFrames: 0,
-      confidence: obj.score
+      smoothBbox: [...obj.bbox] as [number, number, number, number]
     };
   };
 
@@ -688,48 +660,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Tracking Sensitivity */}
-                <div className="space-y-3">
-                  <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50">Min Object Size (px)</label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {[30, 50, 100].map((val) => (
-                      <button
-                        key={val}
-                        onClick={() => setMinObjectSize(val)}
-                        className={`py-2.5 rounded-xl border text-[10px] font-bold transition-all flex items-center justify-center gap-2 ${
-                          minObjectSize === val 
-                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.1)]' 
-                            : 'bg-white/5 border-white/10 text-white/50 hover:bg-white/10'
-                        }`}
-                      >
-                        {minObjectSize === val && <Check className="w-3 h-3" />}
-                        {val}px
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Smoothing Factor */}
-                <div className="space-y-3">
-                  <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50">Smoothing (EMA Alpha)</label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {[0.1, 0.25, 0.5].map((val) => (
-                      <button
-                        key={val}
-                        onClick={() => setSmoothingFactor(val)}
-                        className={`py-2.5 rounded-xl border text-[10px] font-bold transition-all flex items-center justify-center gap-2 ${
-                          smoothingFactor === val 
-                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 shadow-[0_0_15px_rgba(245,158,11,0.1)]' 
-                            : 'bg-white/5 border-white/10 text-white/50 hover:bg-white/10'
-                        }`}
-                      >
-                        {smoothingFactor === val && <Check className="w-3 h-3" />}
-                        {val === 0.1 ? 'High' : val === 0.25 ? 'Med' : 'Low'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
                 <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
                   <p className="text-[10px] text-white/40 leading-relaxed italic">
                     Note: Higher resolutions and frame rates increase neural processing load and battery consumption. 
@@ -795,3 +725,4 @@ export default function App() {
     </div>
   );
 }
+       
