@@ -43,6 +43,8 @@ export default function App() {
   const [modelError, setModelError] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [selectedCoords, setSelectedCoords] = useState<{x:number, y:number, w:number, h:number} | null>(null);
+  const [minObjectSize, setMinObjectSize] = useState(40);
+  const [detectionInterval, setDetectionInterval] = useState(2); // Detect every N frames
 
   // Mutable refs for high-frequency loops (no React re-renders)
   const predictionsRef = useRef<DetectedObject[]>([]);
@@ -64,6 +66,12 @@ export default function App() {
       await tf.ready();
       
       const loadedModel = await cocoSsd.load({ base: 'mobilenet_v2' });
+      
+      // Warm up the model
+      const dummy = tf.zeros([300, 300, 3], 'int32');
+      await loadedModel.detect(dummy as any);
+      tf.dispose(dummy);
+
       setModel(loadedModel);
       setIsModelLoading(false);
     } catch (error) {
@@ -140,37 +148,45 @@ export default function App() {
     let active = true;
     let frameCount = 0;
     let lastTime = performance.now();
+    let loopCount = 0;
 
     const detect = async () => {
       if (!active) return;
       
       if (model && videoRef.current && videoRef.current.readyState === 4) {
         try {
-          // Broadened object identification: 50 max objects, 35% minimum confidence
-          const predictions = await model.detect(videoRef.current, 50, 0.35);
-          predictionsRef.current = predictions;
-
-          if (trackedTargetRef.current) {
-            const currentTrackedClass = trackedTargetRef.current.class;
-            const candidates = predictions.filter((p: any) => p.class === currentTrackedClass);
+          loopCount++;
+          
+          // Run model inference every N frames
+          if (loopCount % detectionInterval === 0 && videoRef.current) {
+            const predictions = await model.detect(videoRef.current, 50, 0.25);
             
-            if (candidates.length > 0) {
-              const getCenter = (bbox: number[]) => [bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2];
-              const targetCenter = getCenter(trackedTargetRef.current.smoothBbox);
-              
-              let bestMatch = candidates[0];
-              let minDistance = Infinity;
-              
-              candidates.forEach((c: any) => {
-                const center = getCenter(c.bbox);
-                const dist = Math.hypot(center[0] - targetCenter[0], center[1] - targetCenter[1]);
-                if (dist < minDistance) {
-                  minDistance = dist;
-                  bestMatch = c;
-                }
-              });
+            // Filter by min size
+            const filteredPredictions = predictions.filter(p => (p.bbox[2] * p.bbox[3]) > (minObjectSize * minObjectSize));
+            predictionsRef.current = filteredPredictions;
 
-              trackedTargetRef.current.bbox = bestMatch.bbox;
+            if (trackedTargetRef.current) {
+              const target = trackedTargetRef.current;
+              const candidates = filteredPredictions.filter(p => p.class === target.class);
+              
+              if (candidates.length > 0) {
+                const getCenter = (bbox: number[]) => [bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2];
+                const targetCenter = getCenter(target.smoothBbox);
+                
+                let bestMatch = candidates[0];
+                let minDistance = Infinity;
+                
+                candidates.forEach((c) => {
+                  const center = getCenter(c.bbox);
+                  const dist = Math.hypot(center[0] - targetCenter[0], center[1] - targetCenter[1]);
+                  if (dist < minDistance) {
+                    minDistance = dist;
+                    bestMatch = c;
+                  }
+                });
+
+                target.bbox = bestMatch.bbox;
+              }
             }
           }
 
@@ -195,7 +211,7 @@ export default function App() {
       detect();
     }
     return () => { active = false; };
-  }, [model, isCameraActive, isModelLoading, targetFps]);
+  }, [model, isCameraActive, isModelLoading, targetFps, detectionInterval, minObjectSize]);
 
   // UI Throttle Loop (Updates React UI state sparingly to save performance)
   useEffect(() => {
@@ -252,10 +268,10 @@ export default function App() {
             ctx.fillText(`${obj.class.toUpperCase()} ${(obj.score*100).toFixed(0)}%`, obj.bbox[0] + 5, obj.bbox[1] - 7);
           });
 
-          // Process Tracked Target with Exponential Moving Average (EMA) smoothing
+          // Process Tracked Target with Kalman + EMA smoothing
           if (trackedTargetRef.current) {
             const target = trackedTargetRef.current;
-            const alpha = 0.25; // Smoothness factor (lower = smoother but more delay)
+            const alpha = 0.3; // EMA factor
 
             target.smoothBbox = [
               target.smoothBbox[0] + alpha * (target.bbox[0] - target.smoothBbox[0]),
@@ -414,7 +430,8 @@ export default function App() {
           autoPlay
           muted
           playsInline
-          className="absolute inset-0 w-full h-full object-cover opacity-80 mix-blend-screen"
+          className="absolute inset-0 w-full h-full object-cover opacity-80 mix-blend-screen contrast-125 saturate-110 brightness-110"
+          style={{ filter: 'contrast(1.2) saturate(1.1) brightness(1.1) sharpness(1.2)' }}
         />
         
         {/* Hardware Accelerated Canvas Overlay */}
@@ -433,12 +450,20 @@ export default function App() {
             <div className="text-sm text-white/60 max-w-md mb-8 leading-relaxed font-light whitespace-pre-line">
               {cameraError || "The application requires camera access to process spatial data in real-time."}
             </div>
-            <button 
-              onClick={startCamera}
-              className="px-8 py-3.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 text-xs font-bold uppercase tracking-[0.2em] rounded-xl transition-all hover:shadow-[0_0_20px_rgba(0,240,255,0.2)] flex items-center gap-2"
-            >
-              <RefreshCw className="w-4 h-4" /> {cameraError ? "Retry Connection" : "Enable Bridge"}
-            </button>
+            <div className="flex gap-3">
+              <button 
+                onClick={startCamera}
+                className="px-8 py-3.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 text-xs font-bold uppercase tracking-[0.2em] rounded-xl transition-all hover:shadow-[0_0_20px_rgba(0,240,255,0.2)] flex items-center gap-2"
+              >
+                <RefreshCw className="w-4 h-4" /> {cameraError ? "Retry Connection" : "Enable Bridge"}
+              </button>
+              <button 
+                onClick={() => window.open(window.location.href, '_blank')}
+                className="px-8 py-3.5 bg-white/5 hover:bg-white/10 text-white border border-white/10 text-xs font-bold uppercase tracking-[0.2em] rounded-xl transition-all flex items-center gap-2"
+              >
+                Open in New Tab
+              </button>
+            </div>
           </div>
         )}
 
@@ -536,12 +561,18 @@ export default function App() {
             </div>
             <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-1.5 md:gap-3 relative z-10 overflow-y-auto md:overflow-visible custom-scrollbar">
               {['X', 'Y', 'W', 'H'].map((dim) => {
-                const val = selectedCoords ? (dim === 'X' ? selectedCoords.x : dim === 'Y' ? selectedCoords.y : dim === 'W' ? selectedCoords.w : selectedCoords.h) : null;
+                let val: number | string | null = null;
+                if (selectedCoords) {
+                  if (dim === 'X') val = selectedCoords.x;
+                  else if (dim === 'Y') val = selectedCoords.y;
+                  else if (dim === 'W') val = selectedCoords.w;
+                  else if (dim === 'H') val = selectedCoords.h;
+                }
                 return (
                   <div key={dim} className="flex flex-col justify-center bg-black/20 rounded-lg md:rounded-xl p-1.5 md:p-3 border border-white/5">
                     <span className="text-[7px] md:text-[9px] font-bold text-white/30 uppercase tracking-widest mb-0.5 md:mb-1.5">{dim}</span>
                     <span className={`text-xs md:text-xl font-mono tracking-tight font-light ${val !== null ? 'text-cyan-50 drop-shadow-[0_0_8px_rgba(0,240,255,0.4)]' : 'text-white/20'}`}>
-                      {val !== null ? val.toString().padStart(4, '0') : '0000'}
+                      {val !== null ? val.toString().padStart(dim.length > 1 ? 1 : 4, '0') : '0000'}
                     </span>
                   </div>
                 )
@@ -654,6 +685,42 @@ export default function App() {
                         }`}
                       >
                         {targetResolution === val && <Check className="w-3 h-3" />}
+                        {val}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Min Object Size */}
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50">Min Object Size (px)</label>
+                  <div className="flex items-center gap-4">
+                    <input 
+                      type="range" 
+                      min="10" 
+                      max="200" 
+                      value={minObjectSize} 
+                      onChange={(e) => setMinObjectSize(parseInt(e.target.value))}
+                      className="flex-1 accent-cyan-400"
+                    />
+                    <span className="text-xs font-mono text-cyan-400 w-8">{minObjectSize}</span>
+                  </div>
+                </div>
+
+                {/* Detection Interval */}
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-100/50">Inference Skip (Frames)</label>
+                  <div className="grid grid-cols-4 gap-2">
+                    {[1, 2, 3, 4].map((val) => (
+                      <button
+                        key={val}
+                        onClick={() => setDetectionInterval(val)}
+                        className={`py-2.5 rounded-xl border text-[10px] font-bold transition-all flex items-center justify-center gap-2 ${
+                          detectionInterval === val 
+                            ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300 shadow-[0_0_15px_rgba(0,240,255,0.1)]' 
+                            : 'bg-white/5 border-white/10 text-white/50 hover:bg-white/10'
+                        }`}
+                      >
                         {val}
                       </button>
                     ))}
