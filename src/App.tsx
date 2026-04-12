@@ -1,4 +1,4 @@
-/**
+ /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -26,10 +26,15 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
+  // Worker-based detection
+  const workerRef = useRef<Worker | null>(null);
   const [isModelLoading, setIsModelLoading] = useState(true);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isWorkerReady, setIsWorkerReady] = useState(false);
   
+  // HUD state (Floating panels open by default)
+  const [isEntityFeedOpen, setIsEntityFeedOpen] = useState(true);
+
   // React state for UI (updated throttled)
   const [detectedUIObjects, setDetectedUIObjects] = useState<DetectedObject[]>([]);
   const [trackingLabel, setTrackingLabel] = useState<string | null>(null);
@@ -43,56 +48,91 @@ export default function App() {
   const [modelError, setModelError] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [selectedCoords, setSelectedCoords] = useState<{x:number, y:number, w:number, h:number} | null>(null);
+  const [detectionHistory, setDetectionHistory] = useState<string[]>([]);
   const [minObjectSize, setMinObjectSize] = useState(40);
-  const [detectionInterval, setDetectionInterval] = useState(2); // Detect every N frames
+  const [detectionInterval, setDetectionInterval] = useState(1); 
 
-  // Mutable refs for high-frequency loops (no React re-renders)
+  // Mutable refs for high-frequency loops
   const predictionsRef = useRef<DetectedObject[]>([]);
   const trackedTargetRef = useRef<TrackedTarget | null>(null);
+  const processingRef = useRef<boolean>(false);
 
   // Colors
   const colors = {
-    primary: '#00F0FF', // Cyan
-    secondary: '#7000FF', // Deep Indigo
-    tracking: '#00FF41', // Accent Green for hit
-    background: 'rgba(10, 15, 30, 0.8)',
+    primary: '#00F0FF',
+    secondary: '#7000FF',
+    tracking: '#00FF41',
+    locked: '#FF3333', // Tactical Red
+    background: 'rgba(8, 12, 24, 0.75)', // Deeper liquid navy
+    glass: 'rgba(255, 255, 255, 0.05)',
+    accent: 'rgba(0, 240, 255, 0.2)',
   };
 
-  // Load COCO-SSD Model with Retry Logic
-  const loadModel = useCallback(async (retryCount = 0) => {
-    try {
-      setIsModelLoading(true);
-      setModelError(null);
-      await tf.ready();
-      
-      const loadedModel = await cocoSsd.load({ base: 'mobilenet_v2' });
-      
-      // Warm up the model
-      const dummy = tf.zeros([300, 300, 3], 'int32');
-      await loadedModel.detect(dummy as any);
-      tf.dispose(dummy);
+  // Initialize Web Worker
+  useEffect(() => {
+    const worker = new Worker(new URL('./vision.worker.ts', import.meta.url), { type: 'module' });
+    workerRef.current = worker;
 
-      setModel(loadedModel);
-      setIsModelLoading(false);
-    } catch (error) {
-      console.error(`Model load attempt ${retryCount + 1} failed:`, error);
-      if (retryCount < 2) {
-        setTimeout(() => loadModel(retryCount + 1), 2000 * (retryCount + 1));
-      } else {
-        setModelError('Neural weights fetch failed. Please check network/ad-blockers.');
+    worker.onmessage = (e) => {
+      const { type, predictions, message } = e.data;
+      if (type === 'MODEL_READY') {
+        setIsModelLoading(false);
+        setIsWorkerReady(true);
+      } else if (type === 'DETECTIONS') {
+        predictionsRef.current = predictions;
+        processingRef.current = false;
+
+        // Update detection history
+        if (predictions.length > 0) {
+          setDetectionHistory(prev => {
+            const newClasses = (predictions as DetectedObject[]).map(p => p.class);
+            const combined = [...new Set([...prev, ...newClasses])];
+            return combined.slice(-15); // Keep last 15 unique entities
+          });
+        }
+
+        // Efficient tracking update
+        if (trackedTargetRef.current) {
+          const target = trackedTargetRef.current;
+          const candidates = (predictions as DetectedObject[]).filter(p => p.class === target.class);
+          
+          if (candidates.length > 0) {
+            const getCenter = (bbox: number[]) => [bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2];
+            const targetCenter = getCenter(target.smoothBbox);
+            
+            let bestMatch = candidates[0];
+            let minDistance = Infinity;
+            
+            candidates.forEach((c) => {
+              const center = getCenter(c.bbox);
+              const dist = Math.hypot(center[0] - targetCenter[0], center[1] - targetCenter[1]);
+              if (dist < minDistance) {
+                minDistance = dist;
+                bestMatch = c;
+              }
+            });
+            target.bbox = bestMatch.bbox;
+          }
+        }
+      } else if (type === 'ERROR') {
+        setModelError(message);
         setIsModelLoading(false);
       }
-    }
-  }, []);
+    };
 
-  useEffect(() => { loadModel(); }, [loadModel]);
+    worker.postMessage({ type: 'INIT' });
+
+    return () => {
+      worker.terminate();
+    };
+  }, []);
 
   // Setup Camera
   const startCamera = useCallback(async () => {
     if (!videoRef.current) return;
     try {
       setCameraError(null);
-      
+      setDetectionHistory([]); // Refresh history on system run
       const resMap = {
         '480p': { width: 640, height: 480 },
         '720p': { width: 1280, height: 720 },
@@ -109,26 +149,12 @@ export default function App() {
         audio: false,
       };
 
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('BROWSER_UNSUPPORTED');
-      }
-
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       videoRef.current.srcObject = stream;
       setIsCameraActive(true);
     } catch (error: any) {
-      console.error('Error accessing camera:', error);
-      
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError' || error.message?.toLowerCase().includes('denied')) {
-        setCameraError('Camera access was denied. To fix this:\n1. Click the lock icon 🔒 in your browser address bar.\n2. Change "Camera" to "Allow".\n3. Refresh the page or click "Retry Connection".\n\nNote: If you are in a private/incognito window, you may need to enable permissions manually.');
-      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-        setCameraError('No camera found. Please ensure your camera is connected and not being used by another app.');
-      } else if (error.message === 'BROWSER_UNSUPPORTED') {
-        setCameraError('Your browser does not support camera access or you are in an insecure context. Please try a different browser or open the app in a new tab.');
-      } else {
-        setCameraError(`Camera Error: ${error.message || 'Unknown error'}. Please ensure no other application is using the camera.`);
-      }
-      
+      console.error('Camera Error:', error);
+      setCameraError(error.message || 'Unknown camera error');
       setIsCameraActive(false);
     }
   }, [cameraFacing, targetResolution, targetFps]);
@@ -143,75 +169,47 @@ export default function App() {
     };
   }, [startCamera]);
 
-  // Detection Loop (Runs as fast as model allows)
+  // Unified Loop for Stats & Worker Capture
   useEffect(() => {
-    let active = true;
     let frameCount = 0;
     let lastTime = performance.now();
-    let loopCount = 0;
+    let animId: number;
 
-    const detect = async () => {
-      if (!active) return;
-      
-      if (model && videoRef.current && videoRef.current.readyState === 4) {
+    const tick = async () => {
+      // FPS Update (every 1s)
+      const now = performance.now();
+      frameCount++;
+      if (now - lastTime >= 1000) {
+        setFps(Math.round((frameCount * 1000) / (now - lastTime)));
+        frameCount = 0;
+        lastTime = now;
+      }
+
+      // Worker Inference submission
+      if (isWorkerReady && videoRef.current && videoRef.current.readyState === 4 && !processingRef.current) {
         try {
-          loopCount++;
-          
-          // Run model inference every N frames
-          if (loopCount % detectionInterval === 0 && videoRef.current) {
-            const predictions = await model.detect(videoRef.current, 50, 0.25);
-            
-            // Filter by min size
-            const filteredPredictions = predictions.filter(p => (p.bbox[2] * p.bbox[3]) > (minObjectSize * minObjectSize));
-            predictionsRef.current = filteredPredictions;
-
-            if (trackedTargetRef.current) {
-              const target = trackedTargetRef.current;
-              const candidates = filteredPredictions.filter(p => p.class === target.class);
-              
-              if (candidates.length > 0) {
-                const getCenter = (bbox: number[]) => [bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2];
-                const targetCenter = getCenter(target.smoothBbox);
-                
-                let bestMatch = candidates[0];
-                let minDistance = Infinity;
-                
-                candidates.forEach((c) => {
-                  const center = getCenter(c.bbox);
-                  const dist = Math.hypot(center[0] - targetCenter[0], center[1] - targetCenter[1]);
-                  if (dist < minDistance) {
-                    minDistance = dist;
-                    bestMatch = c;
-                  }
-                });
-
-                target.bbox = bestMatch.bbox;
-              }
-            }
-          }
-
-          // FPS Calc
-          frameCount++;
-          const now = performance.now();
-          if (now - lastTime >= 1000) {
-            setFps(Math.round((frameCount * 1000) / (now - lastTime)));
-            frameCount = 0;
-            lastTime = now;
-          }
-        } catch (err) {
-          console.error("Detection error:", err);
+          // Offscreen bitmap creation is fast and zero-copy for worker transfer
+          const imageBitmap = await createImageBitmap(videoRef.current);
+          processingRef.current = true;
+          workerRef.current?.postMessage({
+            type: 'DETECT',
+            imageBitmap,
+            minSize: minObjectSize,
+            confidence: 0.35
+          }, [imageBitmap]);
+        } catch (e) {
+          console.error("Bitmap creation error:", e);
         }
       }
-      // Use setTimeout to respect target FPS
-      const delay = 1000 / targetFps;
-      setTimeout(detect, delay); 
+
+      animId = requestAnimationFrame(tick);
     };
 
-    if (isCameraActive && !isModelLoading && model) {
-      detect();
+    if (isCameraActive && isWorkerReady) {
+      animId = requestAnimationFrame(tick);
     }
-    return () => { active = false; };
-  }, [model, isCameraActive, isModelLoading, targetFps, detectionInterval, minObjectSize]);
+    return () => cancelAnimationFrame(animId);
+  }, [isCameraActive, isWorkerReady, minObjectSize]);
 
   // UI Throttle Loop (Updates React UI state sparingly to save performance)
   useEffect(() => {
@@ -228,7 +226,7 @@ export default function App() {
       } else {
         setSelectedCoords(null);
       }
-    }, 250);
+    }, 200);
     return () => clearInterval(interval);
   }, []);
 
@@ -250,29 +248,23 @@ export default function App() {
 
           ctx.clearRect(0, 0, vWidth, vHeight);
 
-          // Draw general unselected objects
+          // Draw general objects
           predictionsRef.current.forEach(obj => {
-            if (trackedTargetRef.current && trackedTargetRef.current.class === obj.class) {
-              return; // Handled separately below
-            }
+            if (trackedTargetRef.current && trackedTargetRef.current.class === obj.class) return;
+            
             ctx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
             ctx.lineWidth = 2;
             ctx.strokeRect(obj.bbox[0], obj.bbox[1], obj.bbox[2], obj.bbox[3]);
             
-            // Draw Label background
-            ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-            ctx.fillRect(obj.bbox[0] - 1, obj.bbox[1] - 22, ctx.measureText(`${obj.class.toUpperCase()} ${(obj.score*100).toFixed(0)}%`).width + 12, 22);
-            // Draw Label Text
             ctx.fillStyle = colors.primary;
-            ctx.font = 'bold 11px "Courier New", Courier, monospace';
-            ctx.fillText(`${obj.class.toUpperCase()} ${(obj.score*100).toFixed(0)}%`, obj.bbox[0] + 5, obj.bbox[1] - 7);
+            ctx.font = '700 10px "Inter", sans-serif';
+            ctx.fillText(`${obj.class.toUpperCase()}`, obj.bbox[0] + 4, obj.bbox[1] - 4);
           });
 
-          // Process Tracked Target with Kalman + EMA smoothing
+          // Draw tracked target
           if (trackedTargetRef.current) {
             const target = trackedTargetRef.current;
-            const alpha = 0.3; // EMA factor
-
+            const alpha = 0.25; 
             target.smoothBbox = [
               target.smoothBbox[0] + alpha * (target.bbox[0] - target.smoothBbox[0]),
               target.smoothBbox[1] + alpha * (target.bbox[1] - target.smoothBbox[1]),
@@ -281,46 +273,26 @@ export default function App() {
             ];
 
             const [x, y, w, h] = target.smoothBbox;
-
-            // Target Highlight Box Core
-            ctx.strokeStyle = colors.primary;
-            ctx.lineWidth = 3;
+            ctx.strokeStyle = colors.locked;
+            ctx.lineWidth = 4;
             ctx.strokeRect(x, y, w, h);
             
-            // Add aesthetic corner accents
-            const cornerLength = 15;
+            // Corner accents
+            const cl = 12;
             ctx.beginPath();
-            ctx.lineWidth = 4;
+            ctx.lineWidth = 3;
             ctx.strokeStyle = '#FFFFFF';
-            
-            // Top Left
-            ctx.moveTo(x, y + cornerLength); ctx.lineTo(x, y); ctx.lineTo(x + cornerLength, y);
-            // Top Right
-            ctx.moveTo(x + w - cornerLength, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + cornerLength);
-            // Bottom Left
-            ctx.moveTo(x, y + h - cornerLength); ctx.lineTo(x, y + h); ctx.lineTo(x + cornerLength, y + h);
-            // Bottom Right
-            ctx.moveTo(x + w - cornerLength, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - cornerLength);
+            ctx.moveTo(x, y+cl); ctx.lineTo(x, y); ctx.lineTo(x+cl, y);
+            ctx.moveTo(x+w-cl, y); ctx.lineTo(x+w, y); ctx.lineTo(x+w, y+cl);
+            ctx.moveTo(x, y+h-cl); ctx.lineTo(x, y+h); ctx.lineTo(x+cl, y+h);
+            ctx.moveTo(x+w-cl, y+h); ctx.lineTo(x+w, y+h); ctx.lineTo(x+w, y+h-cl);
             ctx.stroke();
 
-            // Label
-            const labelText = `LOCKED TRACKING: ${target.class.toUpperCase()}`;
-            ctx.font = 'bold 12px "Courier New", Courier, monospace';
-            const metrics = ctx.measureText(labelText);
-            ctx.fillStyle = colors.primary;
-            ctx.fillRect(x - 2, y - 28, metrics.width + 16, 26);
-            ctx.fillStyle = '#000000';
-            ctx.fillText(labelText, x + 6, y - 10);
-
-            // Crosshair overlay inside block
-            ctx.beginPath();
-            ctx.strokeStyle = 'rgba(0, 240, 255, 0.6)';
-            ctx.lineWidth = 1.5;
-            const cx = x + w / 2;
-            const cy = y + h / 2;
-            ctx.moveTo(cx - 12, cy); ctx.lineTo(cx + 12, cy);
-            ctx.moveTo(cx, cy - 12); ctx.lineTo(cx, cy + 12);
-            ctx.stroke();
+            // Tactical Label
+            ctx.fillStyle = colors.locked;
+            ctx.fillRect(x, y-20, ctx.measureText(`LOCKED: ${target.class.toUpperCase()}`).width + 10, 20);
+            ctx.fillStyle = '#FFF';
+            ctx.fillText(`LOCKED: ${target.class.toUpperCase()}`, x+5, y-6);
           }
         }
       }
@@ -346,19 +318,14 @@ export default function App() {
   }
 
   const handleViewportClick = (e: React.MouseEvent) => {
-    if (!videoRef.current || isModelLoading) return;
-    
-    // Check if the click is on the actual underlying feed size
+    if (!videoRef.current) return;
     const rect = videoRef.current.getBoundingClientRect();
     const videoWidth = videoRef.current.videoWidth || 1;
     const videoHeight = videoRef.current.videoHeight || 1;
-    
     const clickX = ((e.clientX - rect.left) / rect.width) * videoWidth;
     const clickY = ((e.clientY - rect.top) / rect.height) * videoHeight;
 
-    const sortedObjects = [...predictionsRef.current].sort((a, b) => (a.bbox[2] * a.bbox[3]) - (b.bbox[2] * b.bbox[3]));
-    
-    const clickedObj = sortedObjects.find(obj => {
+    const clickedObj = predictionsRef.current.find(obj => {
       const [x, y, w, h] = obj.bbox;
       return clickX >= x && clickX <= x + w && clickY >= y && clickY <= y + h;
     });
@@ -368,61 +335,10 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#05050A] text-white font-sans overflow-hidden flex flex-col selection:bg-cyan-500/30">
-      {/* Dynamic Ambient Background */}
-      <div className="fixed inset-0 z-0 pointer-events-none opacity-40">
-        <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-cyan-900/40 blur-[120px]" />
-        <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-900/30 blur-[120px]" />
-      </div>
-
-      {/* Header / HUD panel */}
-      <header className="px-6 py-4 flex justify-between items-center bg-white/5 backdrop-blur-xl border-b border-white/10 z-20 shadow-[0_4px_30px_rgba(0,0,0,0.3)]">
-        <div className="flex items-center gap-4">
-          <div className="relative w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-400/20 to-indigo-500/20 flex items-center justify-center border border-cyan-400/30 shadow-[0_0_15px_rgba(0,240,255,0.2)]">
-            <Aperture className="w-5 h-5 text-cyan-400" />
-          </div>
-          <div>
-            <h1 className="text-base font-black tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-indigo-400 drop-shadow-sm uppercase">VisionTracker Pro</h1>
-            <div className="flex items-center gap-3 text-[11px] font-medium text-cyan-200/50 uppercase tracking-widest mt-0.5">
-              <span className="flex items-center gap-1.5">
-                <div className={`w-1.5 h-1.5 rounded-full ${isCameraActive ? 'bg-cyan-400 shadow-[0_0_8px_rgba(0,240,255,0.8)] animate-pulse' : 'bg-rose-500'}`} />
-                {isCameraActive ? 'Live Visual Sync' : 'Offline Mode'}
-              </span>
-              <span className="w-1 h-1 rounded-full bg-white/10" />
-              <span className="flex items-center gap-1">
-                <Activity className="w-3 h-3 text-indigo-400" /> FPS: {fps.toString().padStart(2, '0')}
-              </span>
-            </div>
-          </div>
-        </div>
-        <div className="flex gap-3">
-          <button 
-            onClick={() => setShowSettings(true)}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all hover:scale-105 active:scale-95 text-cyan-50/70 hover:text-cyan-400"
-            title="Settings"
-          >
-            <Settings className="w-4 h-4" />
-          </button>
-          <button 
-            onClick={() => setCameraFacing(prev => prev === 'user' ? 'environment' : 'user')}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all hover:scale-105 active:scale-95 text-cyan-50/70 hover:text-cyan-400"
-            title="Flip Camera"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
-          <button 
-            onClick={() => setShowInfo(!showInfo)}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all hover:scale-105 active:scale-95 text-cyan-50/70 hover:text-cyan-400"
-            title="System Info"
-          >
-            <Info className="w-4 h-4" />
-          </button>
-        </div>
-      </header>
-
-      {/* Main Video Viewport Element */}
-      <main 
-        className="relative flex-1 overflow-hidden flex items-center justify-center cursor-crosshair z-10 m-4 rounded-2xl border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.4)] bg-black/50 backdrop-blur-sm group"
+    <div className="fixed inset-0 bg-black text-white font-sans overflow-hidden flex flex-col">
+      {/* FULL SCREEN VIDEO LAYER */}
+      <div 
+        className="absolute inset-0 z-0 cursor-crosshair overflow-hidden"
         onClick={handleViewportClick}
       >
         <video
@@ -430,197 +346,187 @@ export default function App() {
           autoPlay
           muted
           playsInline
-          className="absolute inset-0 w-full h-full object-cover opacity-80 mix-blend-screen contrast-125 saturate-110 brightness-110"
-          style={{ filter: 'contrast(1.2) saturate(1.1) brightness(1.1) sharpness(1.2)' }}
+          className="w-full h-full object-cover scale-105"
         />
-        
-        {/* Hardware Accelerated Canvas Overlay */}
         <canvas 
           ref={canvasRef}
-          className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+          className="absolute inset-0 w-full h-full object-cover pointer-events-none z-10"
         />
+        
+        {/* Dynamic Static HUD Deco */}
+        <div className="absolute inset-0 pointer-events-none border-[30px] border-black/10 z-0" />
+        <div className="absolute top-1/2 left-10 w-20 h-px bg-white/10 hidden md:block" />
+        <div className="absolute top-1/2 right-10 w-20 h-px bg-white/10 hidden md:block" />
+      </div>
 
-        {/* Camera Error / Permission Requirement Request */}
-        {!isCameraActive && !isModelLoading && (
-          <div className="absolute inset-0 z-40 bg-black/60 backdrop-blur-lg flex flex-col items-center justify-center p-6 text-center">
-            <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-white/5 to-white/10 flex items-center justify-center border border-white/10 mb-6 glass-panel">
-              <Camera className="w-10 h-10 text-white/50" />
-            </div>
-            <h3 className="text-lg font-black uppercase tracking-widest mb-3 bg-clip-text text-transparent bg-gradient-to-r from-red-400 to-rose-300">Camera Access Required</h3>
-            <div className="text-sm text-white/60 max-w-md mb-8 leading-relaxed font-light whitespace-pre-line">
-              {cameraError || "The application requires camera access to process spatial data in real-time."}
-            </div>
-            <div className="flex gap-3">
-              <button 
-                onClick={startCamera}
-                className="px-8 py-3.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 text-xs font-bold uppercase tracking-[0.2em] rounded-xl transition-all hover:shadow-[0_0_20px_rgba(0,240,255,0.2)] flex items-center gap-2"
-              >
-                <RefreshCw className="w-4 h-4" /> {cameraError ? "Retry Connection" : "Enable Bridge"}
-              </button>
-              <button 
-                onClick={() => window.open(window.location.href, '_blank')}
-                className="px-8 py-3.5 bg-white/5 hover:bg-white/10 text-white border border-white/10 text-xs font-bold uppercase tracking-[0.2em] rounded-xl transition-all flex items-center gap-2"
-              >
-                Open in New Tab
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Clear Tracking Button Floating within Feed Feed */}
-        <AnimatePresence>
-          {trackingLabel && (
-            <motion.button
-              initial={{ opacity: 0, scale: 0.9, y: -20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.9, y: -20 }}
-              onClick={(e) => { e.stopPropagation(); clearTracking(); }}
-              className="absolute top-6 left-1/2 -translate-x-1/2 z-30 px-6 py-3 bg-red-500/10 hover:bg-red-500/20 backdrop-blur-xl border border-red-500/30 text-red-300 rounded-full text-[10px] font-bold uppercase tracking-widest flex items-center gap-2 shadow-xl transition-all hover:scale-105 active:scale-95"
-            >
-              <RefreshCw className="w-4 h-4" /> Terminate Tracking Lock
-            </motion.button>
-          )}
-        </AnimatePresence>
-
-        {/* Loading State Element */}
-        <AnimatePresence>
-          {isModelLoading && (
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 z-50 bg-[#05050A]/90 backdrop-blur-2xl flex flex-col items-center justify-center gap-8"
-            >
-              <div className="relative">
-                <div className="w-32 h-32 rounded-full flex items-center justify-center relative">
-                  <div className="absolute inset-0 bg-cyan-400/5 rounded-full blur-[20px] animate-pulse" />
-                  <motion.div 
-                    animate={{ rotate: 360 }}
-                    transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
-                    className="absolute inset-0 rounded-full border border-dashed border-cyan-500/40"
-                  />
-                  <motion.div 
-                    animate={{ rotate: -360 }}
-                    transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
-                    className="absolute inset-2 rounded-full border border-transparent border-t-indigo-500/60 border-b-cyan-500/60 opacity-60"
-                  />
-                  <Scan className="w-10 h-10 text-cyan-400" />
+      {/* TOP HUD BAR */}
+      <header className="relative z-30 px-6 py-4 flex justify-between items-start pointer-events-none">
+        <div className="pointer-events-auto">
+          <div className="flex items-center gap-3">
+             <div className="p-2 backdrop-blur-md border border-cyan-500/30 rounded-lg" style={{ backgroundColor: colors.accent }}>
+                <Aperture className="w-5 h-5 text-cyan-400" />
+             </div>
+             <div>
+                <h1 className="text-xs font-black tracking-[0.3em] uppercase text-white drop-shadow-lg">Mission Control</h1>
+                <div className="flex items-center gap-2 mt-1">
+                   <div className={`w-1.5 h-1.5 rounded-full ${isCameraActive ? 'bg-cyan-400 animate-pulse' : 'bg-red-500'}`} />
+                   <span className="text-[9px] font-bold text-cyan-400/70 uppercase tracking-widest">Vision_Link: {isCameraActive ? 'Active' : 'Standby'}</span>
                 </div>
-              </div>
-              <div className="text-center space-y-3">
-                <p className="text-base tracking-[0.4em] uppercase font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-indigo-400">Initializing Neural Engine</p>
-                <div className="flex items-center justify-center gap-2">
-                  <div className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <div className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                </div>
-                <p className="text-xs text-white/40 uppercase tracking-widest font-mono mt-4">Loading Core Vision Weights</p>
-              </div>
-            </motion.div>
-          )}
-
-          {modelError && (
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="absolute inset-0 z-50 bg-[#05050A]/95 backdrop-blur-2xl flex flex-col items-center justify-center p-8 text-center"
-            >
-              <div className="w-20 h-20 rounded-2xl bg-red-500/10 flex items-center justify-center border border-red-500/20 mb-8 shadow-[0_0_30px_rgba(239,68,68,0.15)]">
-                <Target className="w-10 h-10 text-red-500" />
-              </div>
-              <h2 className="text-xl font-black uppercase tracking-[0.2em] mb-4 text-red-400 drop-shadow-md">Critical System Error</h2>
-              <p className="text-sm text-white/60 max-w-sm mb-10 leading-relaxed font-light">
-                {modelError}
-              </p>
-              <button 
-                onClick={() => loadModel()}
-                className="px-8 py-3.5 bg-white/5 hover:bg-white/10 text-white border border-white/20 rounded-xl text-xs font-bold uppercase tracking-[0.2em] transition-all flex items-center gap-2"
-              >
-                <RefreshCw className="w-4 h-4" /> Force Reboot Server
-              </button>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </main>
-
-      {/* Footer Data Panel (Glassmorphic Setup) */}
-      <footer className="h-44 px-4 pb-4 pt-2 z-20 shrink-0">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-full">
-          {/* Spatial Coordinates Info Panel */}
-          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-3 md:p-4 flex flex-row md:flex-col gap-3 md:gap-2 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-[40px] -mr-10 -mt-10 transition-opacity group-hover:opacity-100 opacity-50" />
-            <div className="w-[35%] md:w-full flex flex-col justify-center border-r md:border-r-0 md:border-b border-white/10 pr-3 md:pr-0 md:pb-2 relative z-10 shrink-0">
-              <span className="text-[8px] md:text-[10px] font-bold uppercase tracking-[0.1em] md:tracking-[0.2em] text-cyan-100/50 flex items-center gap-1 md:gap-1.5">
-                <MapPin className="w-2.5 h-2.5 md:w-3 md:h-3 text-cyan-400" /> <span className="truncate">Spatial Data</span>
-              </span>
-              {selectedCoords && (
-                <span className="text-[8px] md:text-[10px] font-bold text-cyan-400 tracking-tighter md:tracking-widest bg-cyan-400/10 px-1.5 md:px-2 py-0.5 rounded-md border border-cyan-400/20 mt-1 inline-block w-fit truncate">
-                  {trackingLabel?.toUpperCase()}
-                </span>
-              )}
-            </div>
-            <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-1.5 md:gap-3 relative z-10 overflow-y-auto md:overflow-visible custom-scrollbar">
-              {['X', 'Y', 'W', 'H'].map((dim) => {
-                let val: number | string | null = null;
-                if (selectedCoords) {
-                  if (dim === 'X') val = selectedCoords.x;
-                  else if (dim === 'Y') val = selectedCoords.y;
-                  else if (dim === 'W') val = selectedCoords.w;
-                  else if (dim === 'H') val = selectedCoords.h;
-                }
-                return (
-                  <div key={dim} className="flex flex-col justify-center bg-black/20 rounded-lg md:rounded-xl p-1.5 md:p-3 border border-white/5">
-                    <span className="text-[7px] md:text-[9px] font-bold text-white/30 uppercase tracking-widest mb-0.5 md:mb-1.5">{dim}</span>
-                    <span className={`text-xs md:text-xl font-mono tracking-tight font-light ${val !== null ? 'text-cyan-50 drop-shadow-[0_0_8px_rgba(0,240,255,0.4)]' : 'text-white/20'}`}>
-                      {val !== null ? val.toString().padStart(dim.length > 1 ? 1 : 4, '0') : '0000'}
-                    </span>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-
-          {/* Environmental Detections Feed List */}
-          <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-3 md:p-4 flex flex-row md:flex-col relative overflow-hidden">
-            <div className="absolute bottom-0 left-0 w-40 h-40 bg-indigo-500/5 rounded-full blur-[40px] -ml-10 -mb-10" />
-            <div className="w-[35%] md:w-full flex flex-col justify-center border-r md:border-r-0 md:border-b border-white/10 pr-3 md:pr-0 md:pb-2 md:mb-3 relative z-10 shrink-0">
-              <span className="text-[8px] md:text-[10px] font-bold uppercase tracking-[0.1em] md:tracking-[0.2em] text-cyan-100/50 flex items-center gap-1 md:gap-1.5">
-                <Scan className="w-2.5 h-2.5 md:w-3 md:h-3 text-indigo-400" /> <span className="truncate">Entities</span>
-              </span>
-              <span className="text-[8px] md:text-[10px] font-bold text-indigo-300 bg-indigo-500/10 px-1.5 md:px-2.5 py-0.5 rounded-md border border-indigo-500/20 mt-1 inline-block w-fit">
-                {detectedUIObjects.length}
-              </span>
-            </div>
-            <div className="flex-1 overflow-y-auto pr-1 md:pr-2 custom-scrollbar relative z-10 md:-mx-1 md:px-1 md:mt-1 ml-2 md:ml-0">
-              {detectedUIObjects.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-[10px] md:text-xs text-white/30 font-light italic tracking-wide">
-                  Scanning...
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 md:gap-2.5 pb-1">
-                  {detectedUIObjects.map((obj, i) => {
-                    const isSelected = trackingLabel === obj.class;
-                    return (
-                      <button
-                        key={`${obj.class}-${i}`}
-                        onClick={() => handleObjectSelect(obj)}
-                        className={`w-full text-left px-2 py-1.5 md:px-3 md:py-2.5 rounded-lg md:rounded-xl text-[8px] md:text-[10px] flex justify-between items-center transition-all ${
-                          isSelected 
-                            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,240,255,0.15)] scale-[1.02]' 
-                            : 'bg-black/40 text-white/70 border border-white/5 hover:bg-white/10 hover:border-white/20 hover:text-white'
-                        }`}
-                      >
-                        <span className="uppercase font-bold tracking-wider truncate mr-1">{obj.class}</span>
-                        <span className={`font-mono ${isSelected ? 'opacity-100' : 'opacity-40'}`}>{(obj.score * 100).toFixed(0)}%</span>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
+             </div>
           </div>
         </div>
+        
+        <div className="flex flex-col items-end gap-2 pointer-events-auto">
+           <div className="backdrop-blur-md border border-white/10 px-3 py-1.5 rounded-md flex items-center gap-4" style={{ backgroundColor: colors.background }}>
+              <span className="text-[10px] font-mono text-white/40 uppercase tracking-widest">Hz_Pulse</span>
+              <span className="text-sm font-mono text-cyan-400">{fps}</span>
+           </div>
+        </div>
+      </header>
+
+      {/* FLOATING SIDEBARS - Desktop Only or Collapsed on Mobile */}
+      <div className="absolute inset-x-6 top-24 bottom-24 pointer-events-none z-20 hidden md:flex justify-between items-stretch">
+      </div>
+
+      {/* RIGHT PANEL: ENTITY FEED - Bottom Right */}
+      <AnimatePresence>
+        {isEntityFeedOpen && (
+          <motion.aside
+            initial={{ x: 300, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 300, opacity: 0 }}
+            className="absolute bottom-28 right-6 md:right-10 z-30 w-64 backdrop-blur-xl border border-white/10 rounded-2xl p-5 pointer-events-auto flex flex-col gap-4 max-h-[40vh]"
+            style={{ backgroundColor: colors.background }}
+          >
+            <div className="flex justify-between items-center border-b border-white/5 pb-3">
+              <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-white/60 flex items-center gap-2">
+                 <Scan className="w-3 h-3" /> Entity_Feed
+              </h3>
+              <button onClick={() => setIsEntityFeedOpen(false)} className="text-white/20 hover:text-white transition-colors">
+                 <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto custom-scrollbar space-y-4">
+              {/* Active Detections */}
+              <div className="space-y-2">
+                <h4 className="text-[8px] font-bold text-cyan-400/50 uppercase tracking-widest">Active_Detections</h4>
+                {detectedUIObjects.length === 0 ? (
+                  <div className="text-[9px] text-white/10 italic text-center py-4 uppercase tracking-widest">Scanning...</div>
+                ) : (
+                  detectedUIObjects.map((obj, i) => (
+                    <button 
+                      key={i} 
+                      onClick={() => handleObjectSelect(obj)}
+                      className={`w-full flex justify-between items-center p-2 rounded-lg border transition-all ${trackingLabel === obj.class ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-400' : 'bg-white/5 border-white/5 text-white/40 hover:bg-white/10'}`}
+                    >
+                      <span className="text-[9px] font-bold uppercase tracking-wider">{obj.class}</span>
+                      <span className="text-[8px] font-mono opacity-60">{(obj.score*100).toFixed(0)}%</span>
+                    </button>
+                  ))
+                )}
+              </div>
+
+              {/* Detection History */}
+              <div className="space-y-2 pt-2 border-t border-white/5">
+                <h4 className="text-[8px] font-bold text-indigo-400/50 uppercase tracking-widest">Session_History</h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {detectionHistory.length === 0 ? (
+                    <div className="text-[8px] text-white/10 italic uppercase tracking-widest">No history</div>
+                  ) : (
+                    detectionHistory.map((h, i) => (
+                      <span key={i} className="px-2 py-1 bg-white/5 border border-white/5 rounded-md text-[8px] font-bold text-white/40 uppercase tracking-tighter">
+                        {h}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.aside>
+        )}
+      </AnimatePresence>
+
+      {/* CONDITIONAL SPATIAL COORDINATES - Top Right */}
+      <AnimatePresence>
+        {selectedCoords && (
+          <motion.div
+            initial={{ x: 50, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 50, opacity: 0 }}
+            className="absolute top-24 right-6 md:right-10 z-30 p-3 backdrop-blur-xl border border-cyan-500/30 rounded-xl pointer-events-none w-48"
+            style={{ backgroundColor: colors.background }}
+          >
+             <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-0.5 border-b border-white/10 pb-2">
+                   <span className="text-[8px] font-black text-cyan-400 uppercase tracking-widest flex items-center gap-2">
+                      <Target className="w-2.5 h-2.5" /> Lock_Acquired
+                   </span>
+                   <span className="text-sm font-black text-white uppercase truncate">{trackingLabel}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                   {['X', 'Y', 'W', 'H'].map((d) => (
+                      <div key={d} className="flex flex-col bg-white/5 p-1.5 rounded-md">
+                         <span className="text-[7px] text-white/30 font-bold">{d}</span>
+                         <span className="text-[10px] font-mono text-cyan-50/80">
+                            {d === 'X' ? selectedCoords.x : d === 'Y' ? selectedCoords.y : d === 'W' ? selectedCoords.w : selectedCoords.h}
+                         </span>
+                      </div>
+                   ))}
+                </div>
+             </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* BOTTOM ACTION BAR - Unified Mobile & Desktop */}
+      <footer className="relative z-40 p-4 md:p-6 mt-auto">
+         <div className="max-w-2xl mx-auto flex items-center justify-center gap-3 md:gap-4">
+            <button 
+              onClick={() => setShowSettings(true)}
+              className="flex-1 md:flex-none p-3 md:px-6 rounded-xl backdrop-blur-lg border border-white/10 hover:bg-white/10 transition-all flex items-center justify-center gap-3"
+              style={{ backgroundColor: colors.background }}
+            >
+               <Settings className="w-4 h-4 text-white/60" />
+               <span className="text-[10px] font-black uppercase tracking-[0.2em] hidden md:block">Sys_Conf</span>
+            </button>
+            <button 
+              onClick={() => setCameraFacing(prev => prev === 'user' ? 'environment' : 'user')}
+              className="p-4 md:p-5 rounded-full bg-cyan-500 text-black shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 active:scale-95 transition-all"
+            >
+               <RefreshCw className="w-5 h-5" />
+            </button>
+            <button 
+              onClick={() => setShowInfo(!showInfo)}
+              className="flex-1 md:flex-none p-3 md:px-6 rounded-xl backdrop-blur-lg border border-white/10 hover:bg-white/10 transition-all flex items-center justify-center gap-3"
+              style={{ backgroundColor: colors.background }}
+            >
+               <Info className="w-4 h-4 text-white/60" />
+               <span className="text-[10px] font-black uppercase tracking-[0.2em] hidden md:block">Manual</span>
+            </button>
+            
+            {/* Toggle buttons for sidebars (visible on mobile only) */}
+            <div className="md:hidden flex gap-2">
+               <button onClick={() => setIsEntityFeedOpen(!isEntityFeedOpen)} className={`p-3 rounded-xl border transition-all ${isEntityFeedOpen ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-400' : 'bg-black/40 border-white/10 text-white/40'}`}>
+                  <Scan className="w-4 h-4" />
+               </button>
+            </div>
+         </div>
       </footer>
+
+      {/* Loading & Error States stay same (optimized) */}
+      <AnimatePresence>
+        {isModelLoading && (
+          <motion.div initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} className="fixed inset-0 z-50 bg-black/90 backdrop-blur-2xl flex flex-col items-center justify-center gap-10">
+             <div className="relative">
+                <motion.div animate={{rotate:360}} transition={{duration:4, repeat:Infinity, ease:"linear"}} className="w-32 h-32 rounded-full border border-dashed border-cyan-500/30" />
+                <Aperture className="absolute inset-0 m-auto w-10 h-10 text-cyan-400 animate-pulse" />
+             </div>
+             <p className="text-xs font-black uppercase tracking-[0.5em] text-cyan-400">Loading Neural Link</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
 
       {/* Manual Info Overlay Component */}
       <AnimatePresence>
